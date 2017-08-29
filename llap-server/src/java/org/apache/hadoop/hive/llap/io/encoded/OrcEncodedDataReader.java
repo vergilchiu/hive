@@ -39,6 +39,7 @@ import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hive.common.Pool;
 import org.apache.hadoop.hive.common.Pool.PoolObjectHelper;
+import org.apache.hadoop.hive.common.io.Allocator.BufferObjectFactory;
 import org.apache.hadoop.hive.common.io.DataCache;
 import org.apache.hadoop.hive.common.io.Allocator;
 import org.apache.hadoop.hive.common.io.encoded.EncodedColumnBatch.ColumnStreamData;
@@ -50,6 +51,7 @@ import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
 import org.apache.hadoop.hive.llap.ConsumerFeedback;
 import org.apache.hadoop.hive.llap.DebugUtils;
 import org.apache.hadoop.hive.llap.cache.BufferUsageManager;
+import org.apache.hadoop.hive.llap.cache.LlapDataBuffer;
 import org.apache.hadoop.hive.llap.cache.LowLevelCache;
 import org.apache.hadoop.hive.llap.cache.LowLevelCache.Priority;
 import org.apache.hadoop.hive.llap.counters.QueryFragmentCounters;
@@ -72,6 +74,7 @@ import org.apache.hadoop.hive.ql.io.orc.encoded.Reader;
 import org.apache.hadoop.hive.ql.io.orc.RecordReaderImpl;
 import org.apache.hadoop.hive.ql.io.orc.encoded.EncodedOrcFile;
 import org.apache.hadoop.hive.ql.io.orc.encoded.EncodedReader;
+import org.apache.hadoop.hive.ql.io.orc.encoded.IoTrace;
 import org.apache.hadoop.hive.ql.io.orc.encoded.OrcBatchKey;
 import org.apache.hadoop.hive.ql.io.orc.encoded.Reader.OrcEncodedColumnBatch;
 import org.apache.hadoop.hive.ql.io.orc.encoded.Reader.PoolFactory;
@@ -164,12 +167,15 @@ public class OrcEncodedDataReader extends CallableWithNdc<Void>
   private volatile boolean isPaused = false;
 
   boolean[] globalIncludes = null;
+  private final IoTrace trace;
+  private Pool<IoTrace> tracePool;
 
   public OrcEncodedDataReader(LowLevelCache lowLevelCache, BufferUsageManager bufferManager,
       OrcMetadataCache metadataCache, Configuration daemonConf, Configuration jobConf,
       FileSplit split, List<Integer> columnIds, SearchArgument sarg, String[] columnNames,
       OrcEncodedDataConsumer consumer, QueryFragmentCounters counters,
-      TypeDescription readerSchema) throws IOException {
+      TypeDescription readerSchema, Pool<IoTrace> tracePool)
+          throws IOException {
     this.lowLevelCache = lowLevelCache;
     this.metadataCache = metadataCache;
     this.bufferManager = bufferManager;
@@ -183,6 +189,8 @@ public class OrcEncodedDataReader extends CallableWithNdc<Void>
     this.columnNames = columnNames;
     this.consumer = consumer;
     this.counters = counters;
+    this.trace = tracePool.take();
+    this.tracePool = tracePool;
     try {
       this.ugi = UserGroupInformation.getCurrentUser();
     } catch (IOException e) {
@@ -190,13 +198,14 @@ public class OrcEncodedDataReader extends CallableWithNdc<Void>
     }
 
     // moved this part of code from performDataRead as LlapInputFormat need to know the file schema
-    // to decide if schema evolution is supported or not
+    // to decide if schema evolution is supported or not.
     orcReader = null;
     // 1. Get file metadata from cache, or create the reader and read it.
     // Don't cache the filesystem object for now; Tez closes it and FS cache will fix all that
     fs = split.getPath().getFileSystem(jobConf);
     fileKey = determineFileId(fs, split,
-        HiveConf.getBoolVar(daemonConf, ConfVars.LLAP_CACHE_ALLOW_SYNTHETIC_FILEID));
+        HiveConf.getBoolVar(daemonConf, ConfVars.LLAP_CACHE_ALLOW_SYNTHETIC_FILEID),
+        HiveConf.getBoolVar(daemonConf, ConfVars.LLAP_CACHE_DEFAULT_FS_FILE_ID));
     fileMetadata = getOrReadFileMetadata();
     if (readerSchema == null) {
       readerSchema = fileMetadata.getSchema();
@@ -246,7 +255,7 @@ public class OrcEncodedDataReader extends CallableWithNdc<Void>
 
   protected Void performDataRead() throws IOException {
     long startTime = counters.startTimeCounter();
-    LlapIoImpl.LOG.info("Processing data for {}", split.getPath());
+    LlapIoImpl.LOG.info("Processing data for file {}: {}", fileKey, split.getPath());
     if (processStop()) {
       recordReaderTime(startTime);
       return null;
@@ -263,14 +272,14 @@ public class OrcEncodedDataReader extends CallableWithNdc<Void>
       // 2. Determine which stripes to read based on the split.
       determineStripesToRead();
     } catch (Throwable t) {
-      recordReaderTime(startTime);
-      consumer.setError(t);
+      handleReaderError(startTime, t);
       return null;
     }
 
     if (stripeRgs.length == 0) {
       consumer.setDone();
       recordReaderTime(startTime);
+      tracePool.offer(trace);
       return null; // No data to read.
     }
     counters.setDesc(QueryFragmentCounters.Desc.STRIPES,
@@ -303,12 +312,11 @@ public class OrcEncodedDataReader extends CallableWithNdc<Void>
       if (!hasData) {
         consumer.setDone();
         recordReaderTime(startTime);
+        tracePool.offer(trace);
         return null; // No data to read.
       }
     } catch (Throwable t) {
-      cleanupReaders();
-      consumer.setError(t);
-      recordReaderTime(startTime);
+      handleReaderError(startTime, t);
       return null;
     }
 
@@ -322,12 +330,10 @@ public class OrcEncodedDataReader extends CallableWithNdc<Void>
       ensureOrcReader();
       // Reader creating updates HDFS counters, don't do it here.
       DataWrapperForOrc dw = new DataWrapperForOrc();
-      stripeReader = orcReader.encodedReader(fileKey, dw, dw, POOL_FACTORY);
+      stripeReader = orcReader.encodedReader(fileKey, dw, dw, POOL_FACTORY, trace);
       stripeReader.setTracing(LlapIoImpl.ORC_LOGGER.isTraceEnabled());
     } catch (Throwable t) {
-      consumer.setError(t);
-      recordReaderTime(startTime);
-      cleanupReaders();
+      handleReaderError(startTime, t);
       return null;
     }
 
@@ -349,6 +355,7 @@ public class OrcEncodedDataReader extends CallableWithNdc<Void>
 
         LlapIoImpl.ORC_LOGGER.trace("Reading stripe {}: {}, {}", stripeIx, stripe.getOffset(),
             stripe.getLength());
+        trace.logReadingStripe(stripeIx, stripe.getOffset(), stripe.getLength());
         rgs = stripeRgs[stripeIxMod];
         if (LlapIoImpl.ORC_LOGGER.isTraceEnabled()) {
           LlapIoImpl.ORC_LOGGER.trace("readState[{}]: {}", stripeIxMod, Arrays.toString(rgs));
@@ -402,9 +409,7 @@ public class OrcEncodedDataReader extends CallableWithNdc<Void>
           counters.incrCounter(LlapIOCounters.METADATA_CACHE_HIT);
         }
       } catch (Throwable t) {
-        consumer.setError(t);
-        cleanupReaders();
-        recordReaderTime(startTime);
+        handleReaderError(startTime, t);
         return null;
       }
       if (processStop()) {
@@ -423,9 +428,7 @@ public class OrcEncodedDataReader extends CallableWithNdc<Void>
             stripeMetadata.getEncodings(), stripeMetadata.getStreams(), globalIncludes,
             rgs, consumer);
       } catch (Throwable t) {
-        consumer.setError(t);
-        cleanupReaders();
-        recordReaderTime(startTime);
+        handleReaderError(startTime, t);
         return null;
       }
     }
@@ -435,10 +438,18 @@ public class OrcEncodedDataReader extends CallableWithNdc<Void>
     consumer.setDone();
 
     LlapIoImpl.LOG.trace("done processing {}", split);
-
+    tracePool.offer(trace);
     // Close the stripe reader, we are done reading.
     cleanupReaders();
     return null;
+  }
+
+  private void handleReaderError(long startTime, Throwable t) {
+    recordReaderTime(startTime);
+    consumer.setError(t);
+    trace.dumpLog(LOG);
+    cleanupReaders();
+    tracePool.offer(trace);
   }
 
   private void recordReaderTime(long startTime) {
@@ -502,12 +513,13 @@ public class OrcEncodedDataReader extends CallableWithNdc<Void>
   private boolean processStop() {
     if (!isStopped) return false;
     LOG.info("Encoded data reader is stopping");
+    tracePool.offer(trace);
     cleanupReaders();
     return true;
   }
 
   private static Object determineFileId(FileSystem fs, FileSplit split,
-      boolean allowSynthetic) throws IOException {
+      boolean allowSynthetic, boolean checkDefaultFs) throws IOException {
     if (split instanceof OrcSplit) {
       Object fileKey = ((OrcSplit)split).getFileKey();
       if (fileKey != null) {
@@ -515,7 +527,7 @@ public class OrcEncodedDataReader extends CallableWithNdc<Void>
       }
     }
     LOG.warn("Split for " + split.getPath() + " (" + split.getClass() + ") does not have file ID");
-    return HdfsUtils.getFileId(fs, split.getPath(), allowSynthetic);
+    return HdfsUtils.getFileId(fs, split.getPath(), allowSynthetic, checkDefaultFs);
   }
 
   /**
@@ -731,11 +743,14 @@ public class OrcEncodedDataReader extends CallableWithNdc<Void>
       if (LlapIoImpl.ORC_LOGGER.isTraceEnabled()) {
         if (isNone) {
           LlapIoImpl.ORC_LOGGER.trace("SARG eliminated all RGs for stripe {}", stripeIx);
+          trace.logSargResult(stripeIx, 0);
         } else if (!isAll) {
           LlapIoImpl.ORC_LOGGER.trace("SARG picked RGs for stripe {}: {}",
               stripeIx, DebugUtils.toString(rgsToRead));
+          trace.logSargResult(stripeIx, rgsToRead);
         } else {
           LlapIoImpl.ORC_LOGGER.trace("Will read all {} RGs for stripe {}", rgCount, stripeIx);
+          trace.logSargResult(stripeIx, rgCount);
         }
       }
       assert isAll || isNone || rgsToRead.length == rgCount;
@@ -814,7 +829,7 @@ public class OrcEncodedDataReader extends CallableWithNdc<Void>
     stripeRgs = new boolean[stripeIxTo - stripeIxFrom][];
   }
 
-  private class DataWrapperForOrc implements DataReader, DataCache {
+  private class DataWrapperForOrc implements DataReader, DataCache, BufferObjectFactory {
     private final DataReader orcDataReader;
 
     private DataWrapperForOrc(DataWrapperForOrc other) {
@@ -834,6 +849,7 @@ public class OrcEncodedDataReader extends CallableWithNdc<Void>
       if (LlapIoImpl.ORC_LOGGER.isTraceEnabled()) {
         LlapIoImpl.ORC_LOGGER.trace("Disk ranges after data cache (file " + fileKey +
             ", base offset " + baseOffset + "): " + RecordReaderUtils.stringifyDiskRanges(result));
+        // TODO: trace ranges here? Between data cache and incomplete cb cache
       }
       if (gotAllData.value) return result;
       return (metadataCache == null) ? result
@@ -886,6 +902,7 @@ public class OrcEncodedDataReader extends CallableWithNdc<Void>
         LlapIoImpl.ORC_LOGGER.trace("Disk ranges after disk read (file {}, base offset {}): {}",
             fileKey, baseOffset, RecordReaderUtils.stringifyDiskRanges(result));
       }
+      trace.logRanges(fileKey, baseOffset, result, IoTrace.RangesSrc.DISK);
       return result;
     }
 
@@ -932,10 +949,24 @@ public class OrcEncodedDataReader extends CallableWithNdc<Void>
     public OrcProto.StripeFooter readStripeFooter(StripeInformation stripe) throws IOException {
       return orcDataReader.readStripeFooter(stripe);
     }
+
+    @Override
+    public BufferObjectFactory getDataBufferFactory() {
+      return this;
+    }
+
+    @Override
+    public MemoryBuffer create() {
+      return new LlapDataBuffer();
+    }
   }
 
   @Override
   public TezCounters getTezCounters() {
     return counters.getTezCounters();
+  }
+
+  public IoTrace getTrace() {
+    return trace;
   }
 }

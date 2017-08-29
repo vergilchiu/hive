@@ -29,6 +29,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Random;
@@ -48,13 +49,10 @@ import org.apache.hadoop.fs.PathFilter;
 import org.apache.hadoop.fs.Trash;
 import org.apache.hadoop.fs.permission.FsAction;
 import org.apache.hadoop.hive.conf.HiveConf;
-import org.apache.hadoop.hive.conf.HiveConfUtil;
-import org.apache.hadoop.hive.io.HdfsUtils;
 import org.apache.hadoop.hive.shims.HadoopShims;
 import org.apache.hadoop.hive.shims.ShimLoader;
 import org.apache.hadoop.hive.shims.Utils;
 import org.apache.hadoop.security.UserGroupInformation;
-import org.apache.hadoop.util.Shell;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.hive.common.util.ShutdownHookManager;
 import org.slf4j.Logger;
@@ -82,6 +80,27 @@ public final class FileUtils {
       return !name.startsWith(".");
     }
   };
+
+  public static final PathFilter SNAPSHOT_DIR_PATH_FILTER = new PathFilter() {
+    @Override
+    public boolean accept(Path p) {
+      return ".snapshot".equalsIgnoreCase(p.getName());
+    }
+  };
+
+  /**
+   * Check if the path contains a subdirectory named '.snapshot'
+   * @param p path to check
+   * @param fs filesystem of the path
+   * @return true if p contains a subdirectory named '.snapshot'
+   * @throws IOException
+   */
+  public static boolean pathHasSnapshotSubDir(Path p, FileSystem fs) throws IOException {
+    // Hadoop is missing a public API to check for snapshotable directories. Check with the directory name
+    // until a more appropriate API is provided by HDFS-12257.
+    final FileStatus[] statuses = fs.listStatus(p, FileUtils.SNAPSHOT_DIR_PATH_FILTER);
+    return statuses != null && statuses.length != 0;
+  }
 
   /**
    * Variant of Path.makeQualified that qualifies the input path against the default file system
@@ -590,16 +609,6 @@ public final class FileUtils {
     return copy(srcFS, src, dstFS, dst, deleteSource, overwrite, conf, ShimLoader.getHadoopShims());
   }
 
-  /**
-   * Copies files between filesystems as a fs super user using distcp, and runs
-   * as a privileged user.
-   */
-  public static boolean privilegedCopy(FileSystem srcFS, Path src, Path dst,
-      HiveConf conf) throws IOException {
-    String privilegedUser = conf.getVar(HiveConf.ConfVars.HIVE_DISTCP_DOAS_USER);
-    return distCp(srcFS, src, dst, false, privilegedUser, conf, ShimLoader.getHadoopShims());
-  }
-
   @VisibleForTesting
   static boolean copy(FileSystem srcFS, Path src,
     FileSystem dstFS, Path dst,
@@ -622,7 +631,7 @@ public final class FileUtils {
                 HiveConf.ConfVars.HIVE_EXEC_COPYFILE_MAXNUMFILES) + ")");
         LOG.info("Launch distributed copy (distcp) job.");
         triedDistcp = true;
-        copied = distCp(srcFS, src, dst, deleteSource, null, conf, shims);
+        copied = distCp(srcFS, Collections.singletonList(src), dst, deleteSource, null, conf, shims);
       }
     }
     if (!triedDistcp) {
@@ -635,17 +644,19 @@ public final class FileUtils {
     return copied;
   }
 
-  static boolean distCp(FileSystem srcFS, Path src, Path dst,
+  public static boolean distCp(FileSystem srcFS, List<Path> srcPaths, Path dst,
       boolean deleteSource, String doAsUser,
       HiveConf conf, HadoopShims shims) throws IOException {
     boolean copied = false;
     if (doAsUser == null){
-      copied = shims.runDistCp(src, dst, conf);
+      copied = shims.runDistCp(srcPaths, dst, conf);
     } else {
-      copied = shims.runDistCpAs(src, dst, conf, doAsUser);
+      copied = shims.runDistCpAs(srcPaths, dst, conf, doAsUser);
     }
     if (copied && deleteSource) {
-      srcFS.delete(src, true);
+      for (Path path : srcPaths) {
+        srcFS.delete(path, true);
+      }
     }
     return copied;
   }
