@@ -255,6 +255,10 @@ public final class FunctionRegistry {
     system.registerGenericUDF("encode", GenericUDFEncode.class);
     system.registerGenericUDF("decode", GenericUDFDecode.class);
 
+    //by zhaowei 20170829
+    system.registerGenericUDF("contains", GenericUDFContains.class);
+    system.registerGenericUDF("fulltext", GenericUDFFullText.class);
+    
     system.registerGenericUDF("upper", GenericUDFUpper.class);
     system.registerGenericUDF("lower", GenericUDFLower.class);
     system.registerGenericUDF("ucase", GenericUDFUpper.class);

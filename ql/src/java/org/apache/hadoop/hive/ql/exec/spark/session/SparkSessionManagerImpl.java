@@ -130,15 +130,15 @@ public class SparkSessionManagerImpl implements SparkSessionManager {
 
   @Override
   public void closeSession(SparkSession sparkSession) throws HiveException {
-    if (sparkSession == null) {
-      return;
-    }
-
-    if (LOG.isDebugEnabled()) {
-      LOG.debug(String.format("Closing session (%s).", sparkSession.getSessionId()));
-    }
-    sparkSession.close();
-    createdSessions.remove(sparkSession);
+//    if (sparkSession == null) {
+//      return;
+//    }
+//
+//    if (LOG.isDebugEnabled()) {
+//      LOG.debug(String.format("Closing session (%s).", sparkSession.getSessionId()));
+//    }
+//    sparkSession.close();
+//    createdSessions.remove(sparkSession);
   }
 
   @Override
